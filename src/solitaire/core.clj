@@ -30,7 +30,7 @@
 
 (defn peek-pop
   ([stack]
-     (peek-pop stack 1))
+     [(peek stack) (if (seq stack) (pop stack))])
   ([stack n]
      (loop [x n
             result [[] stack]]
@@ -58,46 +58,44 @@
 
 (letfn [(move-type [& defns]
           (fn [state]
-            (for [[op source-pred destination-pred] defns
-                  :let [find-movables (source-filter source-pred op)]
-                  source (find-movables state)
-                  destination (find-destinations source destination-pred state)]
-              (move state source destination))))
-        (source-filter [pred op]
-          (fn [{:keys [tableau]}]
-            (->> tableau
-                 (filter pred)
-                 (filter stack-seq?)
-                 (map (tableau-key op)))))
-        (orphan [{[[rank]] :stack}] (not= 13 rank))
+            (for [[source source-pred destination-pred] defns
+                  [moving without-mover] (source-filter source-pred state)
+                  accept-mover (find-destinations destination-pred moving state)]
+              (-> state without-mover accept-mover))))
+        (source-filter [pred source]
+          (->> source
+               (filter pred)
+               (map #(let [{:keys [index]} %]
+                       [(get-in state [:tableau index :stack])
+                        (apply-update [:tableau index :stack] empty)]))))
+        (orphan [{[[rank]] :stack}] (and rank (not= 13 rank)))
         (orphan-parent [[top-card] tableau]
           (filter (parent? top-card) tableau))
         (obscuring-king [{[[rank]] :stack hidden-index :hidden}]
           (and (= rank 13) (> hidden-index 0)))
         (empty-tableau [_ tableau]
           (->> tableau
-               (remove stack-seq?)
+               (remove #(seq (:stack %)))
                (take 1)))
-        (tableau-card [])
-        (stack-seq? [{:keys [stack]}] (seq stack))
-        (tableau-key [& args]
-          (fn [{:keys [index]}] (list* [:tableau index :stack] args)))
-        (find-destinations [[source-key] pred {:keys [tableau] :as state}]
-          (let [stack (get-in state source-key)] 
-            (->> tableau
-                 (pred stack)
-                 (map (tableau-key into stack)))))
+        (card
+          ([]
+             #(peek %))
+          ([fun]
+             #(-> % fun peek))) 
+        (to-foundation [{:keys [foundation]}]
+          )
+        (find-destinations [pred moving {:keys [tableau] :as state}]
+          (->> tableau
+               (pred moving)
+               (map #(let [{:keys [index]} %]
+                       (apply-update [:tableau index :stack] into moving)))))
         (parent? [[rank suit]]
           (fn [{parent-stack :stack}]
             (let [[parent-rank parent-suit] (peek parent-stack)]
               (and (= (red? parent-suit) (black? suit))
                    (= parent-rank (inc rank))))))
-        (move [state source destination]
-          (-> state
-              (apply-update source)
-              (apply-update destination)))
-        (apply-update [state args]
-          (apply update-in state args))
+        (apply-update [keys & args]
+          #(apply update-in % keys args))
         (stock-to-waste [state]
           (let [[new-waste new-stock] (-> state :stock (peek-pop 3))]
             (if (seq new-waste)
@@ -112,9 +110,9 @@
   (defn find-moves [{:keys [tableau] :as state}]
     (let [moves (;apply
                  move-type
-                       [empty orphan orphan-parent]
-                       [empty obscuring-king empty-tableau]
-                    ;   [pop tableau-card to-foundation]
+                       [orphan orphan-parent]
+                       [obscuring-king empty-tableau]
+                       [:tableau (card :stack) to-foundation]
                     ;   (map #(vector pop % to-tableau) [waste-card foundation-card])
                        )]
       (conj (moves state)
