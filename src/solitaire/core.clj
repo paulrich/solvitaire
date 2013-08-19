@@ -51,7 +51,7 @@
 (defn card [[rank suit]]
   [rank (keyword suit)])
 
-(defn normalize [{:keys [stock foundation tableau]}]
+(defn normalize "foo" [{:keys [stock foundation tableau]}]
   "Internal representation:
      :f Foundation: up to four sequences of cards
      :tableau a sequence of maps: {:h index of next hidden :s stack}
@@ -66,7 +66,7 @@
           (cards [coll]
             (->> coll (partition 2) (map card)))]
     [{:foundation (->> foundation (partition 2) (map (fn [[rank suit]] (card-range suit rank))) (pad 4))
-      :tableau (->> tableau (map cards) (map-indexed (fn [index col] {:stack col :hidden index})) (pad 7))
+      :tableau (->> tableau (partition 2) (map cards) (map-indexed (fn [index col] {:stack (vec col) :hidden index})) vec)
       :history []
       :waste []
       :stock (->> stock cards (into clojure.lang.PersistentQueue/EMPTY))}]))
@@ -74,9 +74,7 @@
 (letfn [(move-type [& defns]
           (fn [base-state]
             (m/domonad (m/maybe-t m/sequence-m)
-                       [sub-states (foundation-to-tableau base-state)
-                        state (waste-cards sub-states)
-                        [find-movable destinations] (partition 2 defns)
+                       [[find-movable destinations] (partition 2 defns)
                         source (find-movable state)
                         move (destinations source state)]
                        move)))
@@ -174,31 +172,33 @@
                     (assoc :waste [])
                     (update-in [:history] conj "Filled stock with waste")
                     recur)))))
-        (turn-cards-fn [ask-for-cards]
+        (reveal-cards [query-cards]
           (fn [state]
             (->> (:tableau state)
                  (map-indexed
-                  (fn [index {:keys [stack hidden] :as column}]
+                  (fn [column-index {:keys [stack hidden] :as column}]
                     (if (and (empty? stack)
-                             (< 0 hidden))
-                      (let [card (ask-for-cards index hidden)]
+                             (> hidden 0))
+                      (let [card (query-cards column-index hidden)]
                         (-> column
                             (update-in [:stack] conj card)
                             (update-in [:hidden] dec)))
                       column)))
                  vec
-                 (assoc state :tableau))))]
+                 (assoc state :tableau))))
+        (destinations [x y]
+          (fn [& args]
+            (-> (juxt x y) (apply args) flatten)))]
   (defn find-moves
     ([state]
-       (let [moves (apply move-type
-                          orphan orphan-parent
-                          obscuring-king empty-tableau
-                          tableau-card to-foundation
-                          (mapcat #(vector waste-card %) [to-foundation to-tableau]))]
+       (let [moves (move-type
+                    orphan orphan-parent
+                    obscuring-king empty-tableau
+                    tableau-card to-foundation
+                    waste-card (destinations to-foundation to-tableau))]
          (->> (moves state) (remove nil?))))
-    ([state query-cards]
-       (let [turn-cards (turn-cards-fn query-cards)]
-         (->> state find-moves (map turn-cards))))))
+    ([state query-hidden]
+       (->> state find-moves (map (reveal-cards query-hidden))))))
 
 (defn query-hidden [col index]
   (.start (Thread. #(println "What is at column" (inc col) "card number" index "?")))
@@ -223,20 +223,20 @@
   [initial-state]
   (let [get-next-moves (partial find-moves (memoize query-hidden))]
    (letfn [(add-layouts [previous state]
-             (conj previous (without-history state)))
-           (without-history [state]
-             (select-keys state [:foundation :tableau :stock :waste]))
+             (conj previous (get-layout state)))
+           (get-layout [state]
+             (select-keys state [:foundation :tableau]))
            (winning? [state]
              (if (every? #(= 13 (count %)) (state :foundation))
                (state :history)))
            (in? [previous state]
-             (previous (without-history state)))
+             (previous (get-layout state)))
            (iterate-previous [previous]
              [[] previous])
            (remove-duplicates [[moves previous :as current] next-move]
              (if (in? previous next-move)
                current
-               [(conj moves next-move) (conj previous (without-history next-move))]))]
+               [(conj moves next-move) (conj previous (get-layout next-move))]))]
      (loop [[moves previous-layouts] (reduce remove-duplicates (iterate-previous #{}) (normalize initial-state))]
        (if-let [winning-moves (some winning? moves)]
          winning-moves
