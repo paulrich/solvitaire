@@ -1,7 +1,6 @@
 (ns solitaire.core
   (:require clojure.edn
-            [clojure.algo.monads :as m]
-            [clojure.tools.macro :as macro]))
+            [clojure.algo.monads :as m]))
 
 (defmethod print-method clojure.lang.PersistentQueue [q w] (print-method '<- w) (print-method (seq q) w) (print-method '-< w))
 
@@ -9,7 +8,7 @@
 
 (defn red? [suit] (boolean (red suit)))
 
-(def black? (complement red?))
+(defn black? [suit] (if suit (not (red? suit))))
 
 (defn named [i]
   (if (nil? i)
@@ -93,36 +92,48 @@
 (defn- get-history [state]
   (-> state meta :history reverse))
 
-(defmacro update-fn [fn-name state src-desc ks & body]
-  `(macro/macrolet [(~fn-name [[update-fn# & update-args#] & desc#]
-                              `(-> ~'~state
-                                  (~update-fn# ~'~ks ~@update-args#)
-                                  (vary-meta update-in [:history] conj
-                                             (clojure.string/join " " [~'~src-desc ~@desc#]))))]
-                   ~@body))
+(defn- look-outside-foundation? [{:keys [foundation]} [rank suit]]
+  (and (> rank 2)
+       (->> foundation
+            (filter (comp (if (red? suit) black? red?) not-empty))
+            (every? #(let [[opposite-rank _] (peek %)]
+                       (< opposite-rank (dec rank)))))))
 
-(defmacro map-fn [fn-name new-state area update desc & body]
-  `(macro/macrolet [(~fn-name [[index# element#] & mapped-body#]
-                              `(fn [~index# ~element#]
-                                 (update-fn ~'~update ~'~new-state ~'~desc
-                                            (into [~'~area ~index#] (if (= ~'~area :tableau) [:stack]))
-                                            ~@mapped-body#)))]
-                   ~@body))
+(def ^:dynamic current-state)
 
-(defmacro destination [[map-fn-name area moved update-fn-name & post-processing] & body]
-  `(fn [[~moved new-state# desc#] state#]
-     (->> state#
-          ~area
-          (map-indexed
-           (map-fn ~map-fn-name new-state# ~area ~update-fn-name desc#
-                   ~@body))
-          (->cond ~@post-processing ~@post-processing))))
+(defn update-fn [fn-name new-state area index source-move-desc]
+  (fn [form]
+    (if (and (seq? form) (= (first form) fn-name))
+      (let [[func & args] (second form)
+            [_ _ & desc] form]
+        `(-> ~new-state
+             (~func ~(into [area index] (if (= :tableau area) [:stack])) ~@args)
+             (vary-meta update-in [:history] conj
+                        (clojure.string/join " " (list ~source-move-desc ~@desc)))))
+      form)))
+
+(defmacro destination [[map-fn-name area moved update-fn-name & {:keys [pre post]}] & body]
+  (let [[state new-state source-move-desc] (repeatedly gensym)
+        post-processing (if (symbol? post) [post] post)
+        map-fn (fn [form]
+                 (if (and (seq? form) (= (first form) map-fn-name))
+                   (let [[index item] (second form)]
+                     (postwalk (update-fn update-fn-name new-state area index source-move-desc)
+                               `(->> ~state
+                                     ~area
+                                     (map-indexed
+                                      (fn ~@(rest form)))
+                                     ~@post-processing)))
+                   form))]
+    `(fn [& args#]
+       (if-let [[& [[~moved ~new-state ~desc] ~state]] (~(if pre pre identity) args#)]
+         ~@(postwalk (map-fn map-fn-name state new-state area update-fn-name desc) body)))))
 
 (defmacro def-dest [name args & body]
   `(def ~name (destination ~args ~@body)))
 
 (def-dest to-tableau 
-  [foreach :tableau card accept]
+  [foreach :tableau card accept :pre look-outside-foundation?]
   (let [parent? (parent-pred card)]
     (foreach [index column]
              (if (parent? column)
@@ -155,18 +166,18 @@
   (letfn [(desc [card]
             (clojure.string/join " " ["moved" (to-s card) "from waste pile"]))
           (create-source [card state return-values]
-            (conj return-values [card (update-in [:waste] pop) (desc card)]))
-          (next-state [state]
-            (let [[new-waste new-stock] (peek-pop state 3)]
+            (conj return-values [card (update-in state [:waste] pop) (desc card)]))
+          (next-state [{:keys [stock waste] :as state}]
+            (let [[new-waste new-stock] (peek-pop stock 3)]
               (if (empty? new-waste)
-                (recur (update-in [:stock] into (state :waste)))
+                (recur (update-in state [:stock] into waste))
                 (-> state
                     (update-in [:waste] into new-waste)
-                    (assoc-in :stock new-stock)))))]
+                    (assoc :stock new-stock)))))]
     (loop [{:keys [waste stock] :as state} state
            return []]
      (if-let [card (peek waste)]
-       (if-not (-> (map first return) (contains? card))
+       (if-not (-> (map first return) set (contains? card))
          (recur (next-state state) (create-source card state return))
          return)
        (if (or (seq stock) (seq waste))
@@ -235,11 +246,13 @@
                     foundation-card to-tableau
                     waste-card (destinations to-foundation to-tableau))]
          (->> (moves state) (remove nil?))))
-    ([state query-hidden]
-       (->> state find-moves (map (reveal-cards query-hidden))))))
+    ([query-hidden state]
+       (binding [current-state state]
+         (->> state find-moves (map (reveal-cards query-hidden)))))))
 
 (defn query-hidden [col index]
-  (.start (Thread. #(println "What is at column" (inc col) "card number" index "?")))
+  (println (get-history current-state))
+  (println "What is at column" (inc col) "card number" index "?")
   (let [input (atom nil)]
     (while (not (valid-card? @input))
       (reset! input (->> clojure.edn/read repeatedly (take 2) card)))
@@ -262,3 +275,6 @@
                (remove #(contains? moves %))
                (into (pop moves))
                recur))))))
+
+(def test-state '{:stock [6 h 8 c 1 c 5 c 2 c 6 d 10 c 1 h 5 h 3 d 1 d 2 h 9 h 12 c 11 c 7 c 11 h 8 s 5 d 6 s 4 c 11 d 7 h 3 h]
+                  :tableau [12 d 3 s 13 c 2 s 9 d 2 d 6 c]})
