@@ -1,6 +1,7 @@
 (ns solitaire.core
   (:require clojure.edn
-            [clojure.algo.monads :as m]))
+            [clojure.algo.monads :as m]
+            [clojure.walk :refer [postwalk]]))
 
 (defmethod print-method clojure.lang.PersistentQueue [q w] (print-method '<- w) (print-method (seq q) w) (print-method '-< w))
 
@@ -92,12 +93,13 @@
 (defn- get-history [state]
   (-> state meta :history reverse))
 
-(defn- look-outside-foundation? [{:keys [foundation]} [rank suit]]
-  (and (> rank 2)
-       (->> foundation
-            (filter (comp (if (red? suit) black? red?) not-empty))
-            (every? #(let [[opposite-rank _] (peek %)]
-                       (< opposite-rank (dec rank)))))))
+(defn- look-beyond-foundation? [[[[rank suit] {:keys [foundation]}] :as args]]
+  (if (and (> rank 2)
+           (->> foundation
+                (filter (comp (if (red? suit) black? red?) not-empty))
+                (every? #(let [[opposite-rank _] (peek %)]
+                           (< opposite-rank (dec rank))))))
+    args))
 
 (def ^:dynamic current-state)
 
@@ -113,12 +115,12 @@
       form)))
 
 (defmacro destination [[map-fn-name area moved update-fn-name & {:keys [pre post]}] & body]
-  (let [[state new-state source-move-desc] (repeatedly gensym)
+  (let [[state new-state desc] (repeatedly gensym)
         post-processing (if (symbol? post) [post] post)
         map-fn (fn [form]
                  (if (and (seq? form) (= (first form) map-fn-name))
                    (let [[index item] (second form)]
-                     (postwalk (update-fn update-fn-name new-state area index source-move-desc)
+                     (postwalk (update-fn update-fn-name new-state area index desc)
                                `(->> ~state
                                      ~area
                                      (map-indexed
@@ -127,20 +129,20 @@
                    form))]
     `(fn [& args#]
        (if-let [[& [[~moved ~new-state ~desc] ~state]] (~(if pre pre identity) args#)]
-         ~@(postwalk (map-fn map-fn-name state new-state area update-fn-name desc) body)))))
+         ~@(postwalk map-fn body)))))
 
 (defmacro def-dest [name args & body]
   `(def ~name (destination ~args ~@body)))
 
 (def-dest to-tableau 
-  [foreach :tableau card accept :pre look-outside-foundation?]
+  [foreach :tableau card accept :pre look-beyond-foundation?]
   (let [parent? (parent-pred card)]
     (foreach [index column]
              (if (parent? column)
                (accept (update-in conj card) "to tableau column" (inc index))))))
 
 (def-dest to-foundation
-  [foreach :foundation [rank suit :as card] accept take-first]
+  [foreach :foundation [rank suit :as card] accept :post take-first]
   (let [ace? (= rank 1)
         [parent-rank? parent-suit?] (if ace? (repeat nil?)
                                         [#(= (dec rank) %) #(= suit %)])
@@ -149,35 +151,45 @@
              (if (parent? (peek stack))
                (accept (update-in conj card) "to foundation column" (inc index))))))
 
+(defn- use-single-card-stack? [[[[card :as stack] :as first-arg] state :as args]]
+  (if (or (> (count stack) 1)
+          (-> (rest first-arg)
+              (conj card)
+              (list state)
+              look-beyond-foundation?))
+    args))
+
 (def-dest orphan-parent
-  [foreach :tableau [top-card :as stack] accept]
+  [foreach :tableau [top-card :as stack] accept :pre use-single-card-stack?]
   (let [parent? (parent-pred top-card)]
     (foreach [index column]
              (if (parent? column)
-               (accept (update-in into stack) "to" (-> column :stack first to-s) "at column" (inc index))))))
+               (accept (update-in into stack) "to" (-> column :stack last to-s) "at column" (inc index))))))
 
 (def-dest empty-tableau
-  [foreach :tableau king-stack accept take-first]
+  [foreach :tableau king-stack accept :post take-first]
   (foreach [index {:keys [stack hidden]}]
     (if (and (= hidden 0) (empty? stack))
       (accept (assoc-in king-stack) "to column" (inc index)))))
 
 (defn waste-card [state]
   (letfn [(desc [card]
-            (clojure.string/join " " ["moved" (to-s card) "from waste pile"]))
+            (clojure.string/join " " ["Moved" (to-s card) "from waste pile"]))
           (create-source [card state return-values]
             (conj return-values [card (update-in state [:waste] pop) (desc card)]))
           (next-state [{:keys [stock waste] :as state}]
             (let [[new-waste new-stock] (peek-pop stock 3)]
               (if (empty? new-waste)
-                (recur (update-in state [:stock] into waste))
+                (-> state
+                    (update-in [:stock] into waste)
+                    (update-in [:waste] empty))
                 (-> state
                     (update-in [:waste] into new-waste)
                     (assoc :stock new-stock)))))]
     (loop [{:keys [waste stock] :as state} state
            return []]
      (if-let [card (peek waste)]
-       (if-not (-> (map first return) set (contains? card))
+       (if (->> (map first return) (not-any? #(= % card)))
          (recur (next-state state) (create-source card state return))
          return)
        (if (or (seq stock) (seq waste))
@@ -218,19 +230,21 @@
                   (if (seq column)
                     [(peek column) (update-in state [:foundation index] pop)
                      (str "Moved " (-> column peek to-s) " from foundation column " (inc index))])))))
-        (reveal-cards [query-cards]
+        (reveal-cards [known-hidden query-cards]
           (fn [state]
             (->> (:tableau state)
                  (map-indexed
                   (fn [column-index {:keys [stack hidden] :as column}]
                     (if (and (empty? stack)
                              (> hidden 0))
-                      (do
-                        (get-history state)
-                        (let [card (query-cards column-index hidden)]
-                          (-> column
-                              (update-in [:stack] conj card)
-                              (update-in [:hidden] dec))))
+                      (let [card
+                            (if-let [known-card (known-hidden column-index hidden)]
+                              known-card
+                              (binding [current-state state]
+                                (query-cards column-index hidden)))]
+                        (-> column
+                            (update-in [:stack] conj card)
+                            (update-in [:hidden] dec)))
                       column)))
                  vec
                  (assoc state :tableau))))
@@ -246,22 +260,38 @@
                     foundation-card to-tableau
                     waste-card (destinations to-foundation to-tableau))]
          (->> (moves state) (remove nil?))))
-    ([query-hidden state]
-       (binding [current-state state]
-         (->> state find-moves (map (reveal-cards query-hidden)))))))
+    ([known-hidden query-hidden state]
+       (->> state find-moves (map (reveal-cards known-hidden query-hidden))))))
 
-(defn query-hidden [col index]
-  (println (get-history current-state))
+(defn- query-hidden [col index]
+  (if-let [previous-moves (seq (get-history current-state))]
+    (dorun (map println previous-moves)))
   (println "What is at column" (inc col) "card number" index "?")
+  (flush)
   (let [input (atom nil)]
     (while (not (valid-card? @input))
       (reset! input (->> clojure.edn/read repeatedly (take 2) card)))
     (println "Card read:" @input)
     @input))
 
+(defn known-hidden [desc]
+  (let [take-n (fn [coll index]
+                 (take index coll))
+        per-column (fn [index column]
+                     (-> (for [card-seq (partition 2 column)] (card card-seq))
+                         (concat (repeat nil))
+                         (take-n index)
+                         reverse
+                         vec))
+        hidden-cards (->> (-> desc :hidden-cards (concat (repeat nil)) (take-n 6))
+                          (concat [nil])
+                          (map-indexed per-column)
+                          vec)]
+    (fn [col idx] ((hidden-cards col) (dec idx)))))
+
 (defn solve
   [initial-state]
-  (let [get-next-moves (partial find-moves (memoize query-hidden))
+  (let [get-next-moves (partial find-moves (known-hidden initial-state) (memoize query-hidden))
         winning? (fn [state]
                    (if (every? #(= 13 (count %)) (state :foundation))
                      (get-history state)))]
@@ -272,9 +302,10 @@
           (->> (peek moves)
                get-next-moves
                distinct
-               (remove #(contains? moves %))
+               (remove #(some #{%} moves))
                (into (pop moves))
                recur))))))
 
 (def test-state '{:stock [6 h 8 c 1 c 5 c 2 c 6 d 10 c 1 h 5 h 3 d 1 d 2 h 9 h 12 c 11 c 7 c 11 h 8 s 5 d 6 s 4 c 11 d 7 h 3 h]
-                  :tableau [12 d 3 s 13 c 2 s 9 d 2 d 6 c]})
+                  :tableau [12 d 3 s 13 c 2 s 9 d 2 d 6 c]
+                  :hidden-cards [[12 s] [7 s 4 d] [9 c 13 s 5 s] [4 s 8 h 9 s 13 h] [10 d 1 s 10 s 12 h 4 h] [8 d 7 d]]})
