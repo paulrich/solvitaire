@@ -93,13 +93,14 @@
 (defn- get-history [state]
   (-> state meta :history reverse))
 
-(defn- look-beyond-foundation? [[[[rank suit] {:keys [foundation]}] :as args]]
-  (if (and (> rank 2)
-           (->> foundation
-                (filter (comp (if (red? suit) black? red?) not-empty))
-                (every? #(let [[opposite-rank _] (peek %)]
-                           (< opposite-rank (dec rank))))))
-    args))
+(defn- foundation-only? [[[[rank suit] {:keys [foundation]}] :as args]]
+  (or (<= rank 2)
+      (->> foundation
+           (filter #(= (red? suit) (black? (-> % peek second))))
+           (#(concat % (repeat nil)))
+           (take 2)
+           (every? #(let [[opposite-rank _] (peek %)]
+                      ((fnil >= 1) opposite-rank (dec rank)))))))
 
 (def ^:dynamic current-state)
 
@@ -113,6 +114,14 @@
              (vary-meta update-in [:history] conj
                         (clojure.string/join " " (list ~source-move-desc ~@desc)))))
       form)))
+
+(defn process-args [func args]
+  (if-not func
+    args
+    (let [result (func args)]
+      (cond
+       (seq? result) result
+       (true? result) args))))
 
 (defmacro destination [[map-fn-name area moved update-fn-name & {:keys [pre post]}] & body]
   (let [[state new-state desc] (repeatedly gensym)
@@ -128,35 +137,39 @@
                                      ~@post-processing)))
                    form))]
     `(fn [& args#]
-       (if-let [[& [[~moved ~new-state ~desc] ~state]] (~(if pre pre identity) args#)]
+       (if-let [[& [[~moved ~new-state ~desc] ~state]] (process-args ~pre args#)]
          ~@(postwalk map-fn body)))))
 
 (defmacro def-dest [name args & body]
   `(def ~name (destination ~args ~@body)))
 
 (def-dest to-tableau 
-  [foreach :tableau card accept :pre look-beyond-foundation?]
+  [foreach :tableau card accept :pre (complement foundation-only?)]
   (let [parent? (parent-pred card)]
     (foreach [index column]
              (if (parent? column)
                (accept (update-in conj card) "to tableau column" (inc index))))))
 
-(def-dest to-foundation
-  [foreach :foundation [rank suit :as card] accept :post take-first]
-  (let [ace? (= rank 1)
-        [parent-rank? parent-suit?] (if ace? (repeat nil?)
-                                        [#(= (dec rank) %) #(= suit %)])
-        parent? (fn [[rank suit]] (and (parent-rank? rank) (parent-suit? suit)))]
-    (foreach [index stack]
-             (if (parent? (peek stack))
-               (accept (update-in conj card) "to foundation column" (inc index))))))
+(defmacro foundation-dest [& pre-and-post-conditions]
+  (list `destination
+    (into '[foreach :foundation [rank suit :as card] accept] pre-and-post-conditions)
+    '(let [ace? (= rank 1)
+          [parent-rank? parent-suit?] (if ace? (repeat nil?)
+                                          [#(= (dec rank) %) #(= suit %)])
+          parent? (fn [[rank suit]] (and (parent-rank? rank) (parent-suit? suit)))]
+      (foreach [index stack]
+               (if (parent? (peek stack))
+                  (accept (update-in conj card) "to foundation column" (inc index)))))))
+
+(def to-foundation (foundation-dest :post take-first))
+(def safe-foundation (foundation-dest :pre foundation-only? :post take-first))
 
 (defn- use-single-card-stack? [[[[card :as stack] :as first-arg] state :as args]]
   (if (or (> (count stack) 1)
           (-> (rest first-arg)
               (conj card)
               (list state)
-              look-beyond-foundation?))
+              ((complement foundation-only?))))
     args))
 
 (def-dest orphan-parent
@@ -171,6 +184,14 @@
   (foreach [index {:keys [stack hidden]}]
     (if (and (= hidden 0) (empty? stack))
       (accept (assoc-in king-stack) "to column" (inc index)))))
+
+(defn tableau-card [{:keys [tableau] :as state}]
+  (->> tableau
+       (map-indexed
+        (fn [index {:keys [stack]}]
+          (if (seq stack)
+            [(peek stack) (update-in state [:tableau index :stack] pop)
+             (str "Moved " (-> stack peek to-s) " from tableau column " (inc index))])))))
 
 (defn waste-card [state]
   (letfn [(desc [card]
@@ -195,14 +216,15 @@
        (if (or (seq stock) (seq waste))
          (recur (next-state state) return))))))
 
-(letfn [(move-type [& defns]
-          (fn [state]
-            (m/domonad (m/maybe-t m/sequence-m)
-                       [[find-movable destinations] (partition 2 defns)
-                        source (find-movable state)
-                        move (destinations source state)]
-                       move)))
-        (orphan [{:keys [tableau] :as state}]
+(defn move-type [& defns]
+  (fn [state]
+    (m/domonad (m/maybe-t m/sequence-m)
+               [[find-movable destinations] (partition 2 defns)
+                source (find-movable state)
+                move (destinations source state)]
+               move)))
+
+(letfn [(orphan [{:keys [tableau] :as state}]
           (->> tableau
                (map-indexed
                 (fn [index {[[rank] :as stack] :stack}]
@@ -216,13 +238,6 @@
                   (if (and (= rank 13) (> hidden 0))
                     [stack (assoc-in state [:tableau index :stack] [])
                      (str "Moved " (-> stack peek to-s) "'s stack from column " (inc index))])))))
-        (tableau-card [{:keys [tableau] :as state}]
-          (->> tableau
-               (map-indexed
-                (fn [index {:keys [stack]}]
-                  (if (seq stack)
-                    [(peek stack) (update-in state [:tableau index :stack] pop)
-                     (str "Moved " (-> stack peek to-s) " from tableau column " (inc index))])))))
         (foundation-card [{:keys [foundation] :as state}]
           (->> foundation
                (map-indexed
@@ -252,14 +267,20 @@
           (fn [& args]
             (-> (juxt x y) (apply args) flatten)))]
   (defn find-moves
-    ([state]
+    ([initial-state]
        (let [moves (move-type
                     orphan orphan-parent
                     obscuring-king empty-tableau
                     tableau-card to-foundation
-                    foundation-card to-tableau
+                   ; foundation-card to-tableau
                     waste-card (destinations to-foundation to-tableau))]
-         (->> (moves state) (remove nil?))))
+         (->> (loop [state initial-state]
+                (let [[new-state] ((move-type tableau-card safe-foundation) state)]
+                  (if new-state
+                    (recur new-state)
+                    state)))
+              moves
+              (remove nil?))))
     ([known-hidden query-hidden state]
        (->> state find-moves (map (reveal-cards known-hidden query-hidden))))))
 
@@ -294,18 +315,31 @@
   (let [get-next-moves (partial find-moves (known-hidden initial-state) (memoize query-hidden))
         winning? (fn [state]
                    (if (every? #(= 13 (count %)) (state :foundation))
-                     (get-history state)))]
-    (loop [moves (->> initial-state normalize (conj clojure.lang.PersistentQueue/EMPTY))]
+                     (get-history state)))
+        depth (atom 0)
+        previous-parents (atom clojure.lang.PersistentQueue/EMPTY)]
+    (loop [moves (->> initial-state normalize (conj []))]
+      (let [new-depth (-> moves peek get-history count)]
+        (when (> new-depth @depth)
+         (reset! depth new-depth)
+         (println "New max depth:" new-depth)
+         (when (> new-depth 100)
+           (dorun (map println (-> moves peek get-history)))
+           (throw (IllegalStateException.)))))
       (if-let [winning-moves (some winning? moves)]
         winning-moves
         (if (seq moves)
           (->> (peek moves)
                get-next-moves
                distinct
-               (remove #(some #{%} moves))
-               (into (pop moves))
+               (remove #(some #{%} (concat moves @previous-parents)))
+               (#(let [parent (peek moves)]
+                   (swap! previous-parents conj parent)
+                   (while (< 50 (count @previous-parents))
+                     (swap! previous-parents pop))
+                   (into (pop moves) %)))
                recur))))))
 
 (def test-state '{:stock [6 h 8 c 1 c 5 c 2 c 6 d 10 c 1 h 5 h 3 d 1 d 2 h 9 h 12 c 11 c 7 c 11 h 8 s 5 d 6 s 4 c 11 d 7 h 3 h]
                   :tableau [12 d 3 s 13 c 2 s 9 d 2 d 6 c]
-                  :hidden-cards [[12 s] [7 s 4 d] [9 c 13 s 5 s] [4 s 8 h 9 s 13 h] [10 d 1 s 10 s 12 h 4 h] [8 d 7 d]]})
+                  :hidden-cards [[12 s] [7 s 4 d] [9 c 13 s 5 s] [4 s 8 h 9 s 13 h] [10 d 1 s 10 s 12 h 4 h] [8 d 7 d 10 h]]})
